@@ -13,7 +13,8 @@ from langchain.schema import Document
 from urllib.parse import urljoin
 
 # Configure Google Gemini API
-os.environ["GOOGLE_API_KEY"] = "AIzaSyByD2DGdJdAtCS3r2ixLzuMjo7RGRM_Ct8"
+# Put your API key
+os.environ["GOOGLE_API_KEY"] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Function to scrape website content
