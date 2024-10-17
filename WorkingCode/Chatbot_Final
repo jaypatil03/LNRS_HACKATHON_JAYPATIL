@@ -1,0 +1,248 @@
+import streamlit as st
+import os
+import requests
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from urllib.parse import urljoin ,urlparse
+import webbrowser
+
+os.environ["GOOGLE_API_KEY"] = "YOUR_API_KEY"
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+def is_valid_page_link(link_url, base_url):
+    # Parse both the link and the base URL
+    parsed_link = urlparse(link_url)
+    parsed_base = urlparse(base_url)
+    
+    # Exclude fragment links (e.g., #section)
+    if parsed_link.fragment:
+        return False
+    
+    # Exclude file-type URLs (like PDFs, images, etc.)
+    non_html_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.zip', '.doc', '.docx', '.xls', '.xlsx', '.csv']
+    if any(link_url.endswith(ext) for ext in non_html_extensions):
+        return False
+    
+    # Check if the link is to the same page (no path or query in the URL)
+    if parsed_link.path == parsed_base.path and not parsed_link.query:
+        return False
+    
+    return True
+
+def parse_website(url):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract all paragraphs
+            parsed_text = ' '.join([p.text for p in soup.find_all('p')])  
+            
+            # Extract all images
+            images = [urljoin(url, img.get('src')) for img in soup.find_all('img') if img.get('src')]
+
+            # Extract and filter hyperlinks
+            hyperlinks = []
+            for a_tag in soup.find_all('a', href=True):
+                link_url = urljoin(url, a_tag['href'])  # Resolve relative URLs
+                if is_valid_page_link(link_url, url):  # Filter links leading to another page
+                    link_text = a_tag.get_text(strip=True)  # Get the link text
+                    hyperlinks.append({'text': link_text, 'url': link_url})
+                
+            return parsed_text, images, hyperlinks
+        else:
+            st.error(f"Failed to retrieve the website content. Status code: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error occurred during website parsing: {e}")
+    return None, [], []
+
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+def get_vector_store(text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
+
+def get_conversational_chain():
+    prompt_template = """
+    You are having a conversation with a user about the following topic.
+    Build on the previous questions and answers, and keep the conversation flowing naturally.
+    
+    If the answer is not in the provided context, make an educated guess. If the question is completely unrelated to the context, say: 
+    "I can't answer that from the provided information."
+
+    Previous Conversation: 
+    {previous_chat}
+    
+    Context: {context}
+    
+    Question: {question}
+
+    Answer:
+    """
+    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)  
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "previous_chat", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
+
+
+def get_conversational_chain(temperature):
+    prompt_template = """
+    You are having a conversation with the user about a topic based on the website content.
+    Continue the conversation by building on previous answers and questions.
+    Use the website context to answer the user's question, but also keep in mind the previous conversation.
+    
+    If the current question is related to previous questions, provide a response that builds on the previous answers.
+    If the answer cannot be derived from the context, say: "I can't answer that from the provided information."
+
+    Previous Conversation:
+    {previous_chat}
+
+    Context from Website:
+    {context}
+
+    User's Question:
+    {question}
+
+    Your Response:
+    """
+    # Correctly pass the temperature to the ChatGoogleGenerativeAI model
+    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=temperature)
+    
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "previous_chat", "question"])
+    
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
+
+def get_relevant_docs(user_question, vector_store, text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    
+    user_question_embedding = embeddings.embed_query(user_question)
+    relevant_docs_semantic = vector_store.similarity_search_by_vector(user_question_embedding, k=3)
+
+    keyword_results = []
+    lower_question = user_question.lower()
+    
+    for chunk in text_chunks:
+        if lower_question in chunk.lower():  
+            keyword_results.append(Document(page_content=chunk))
+    
+    combined_results = relevant_docs_semantic + keyword_results
+    unique_results = {doc.page_content: doc for doc in combined_results}  
+    relevant_docs = list(unique_results.values())
+    
+    return relevant_docs
+
+def user_input(user_question, temperature):
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+
+    # Use combined semantic and keyword search
+    relevant_docs = get_relevant_docs(user_question, vector_store, st.session_state['parsed_content'])
+
+    if not relevant_docs and st.session_state['parsed_content']:
+        st.warning("No specific matches found, using entire website content as fallback.")
+        relevant_docs = [Document(page_content="\n".join(st.session_state['parsed_content']))]
+
+    # Pass the temperature value to the conversational chain
+    chain = get_conversational_chain(temperature)
+
+    previous_chat = "\n".join(
+        [f"Q: {q}\nA: {r}" for q, r in zip(st.session_state['questions'], st.session_state['responses'])]
+    )
+
+    response = chain({
+        "input_documents": relevant_docs,  
+        "context": "\n".join([doc.page_content for doc in relevant_docs]),  
+        "previous_chat": previous_chat,  
+        "question": user_question
+    }, return_only_outputs=True)
+
+    st.session_state['questions'].append(user_question)
+    st.session_state['responses'].append(response["output_text"])
+
+    st.write("Reply: ", response["output_text"])
+
+def main():
+    st.set_page_config(page_title="Website Content Chat", layout="wide")
+    st.header("Explore and Discuss Website Content Using Chatbot")
+    if 'questions' not in st.session_state:
+        st.session_state['questions'] = []
+    if 'responses' not in st.session_state:
+        st.session_state['responses'] = []
+    if 'website_url' not in st.session_state:
+        st.session_state['website_url'] = ''
+
+    # If the user enters a new website URL, update session state
+    input_url = st.text_input("Enter the website URL", value=st.session_state['website_url'])
+
+    if input_url and st.session_state['website_url'] != input_url:
+        st.session_state['website_url'] = input_url
+        st.session_state.pop('parsed_content', None)  # Clear previous state if new URL is entered
+        st.experimental_rerun()  # Refresh the app with the new URL
+
+    # Add a slider to adjust temperature
+    temperature = st.sidebar.slider('Set response creativity (temperature)', 0.0, 1.0, 0.7)
+
+    if st.session_state['website_url'] and 'parsed_content' not in st.session_state:
+        parsed_text, image_urls, hyperlinks = parse_website(st.session_state['website_url'])
+        if parsed_text:
+            text_chunks = get_text_chunks(parsed_text)
+            st.session_state['parsed_content'] = text_chunks  
+            st.session_state['image_urls'] = image_urls
+            st.session_state['hyperlinks'] = hyperlinks  # Save hyperlinks
+            get_vector_store(text_chunks)
+            st.success("Website content parsed and vectorized.")
+
+    if 'parsed_content' in st.session_state:
+        user_question = st.text_input("Ask a question about the website content")
+        if user_question:
+            user_input(user_question, temperature)  # Pass the temperature here
+    else:
+        st.info("Please enter a website link and wait for it to be parsed before asking questions.")
+    
+    if st.session_state['questions']:
+        st.subheader("Previous Questions and Responses")
+        for i, (question, response) in enumerate(zip(st.session_state['questions'], st.session_state['responses'])):
+            st.write(f"**Question {i+1}:** {question}")
+            st.write(f"**Response {i+1}:** {response}")
+            st.write("---")
+    
+    # Display scraped hyperlinks in a dropdown
+    if 'hyperlinks' in st.session_state and st.session_state['hyperlinks']:
+        st.subheader("Select a Hyperlink to Open or Chat with")
+        link_options = [f"{link['text']}: {link['url']}" for link in st.session_state['hyperlinks']]
+        
+        selected_link = st.selectbox("Hyperlinks", link_options)
+
+        # Extract the URL from the selected option
+        if selected_link:
+            selected_url = selected_link.split(": ")[1]
+            
+            # Add button to open the hyperlink in a new tab
+            if st.button("Open Selected Link"):
+                webbrowser.open_new_tab(selected_url)  # Open the link in a new tab
+
+            # Add button to set the selected hyperlink as the new website URL
+            if st.button("Chat with Selected Link"):
+                st.session_state['website_url'] = selected_url  # Set the selected link as the new URL
+                st.session_state.pop('parsed_content', None)  # Clear previous content state
+                st.experimental_rerun()  # Refresh to load new content from the selected hyperlink
+
+    if 'image_urls' in st.session_state and st.session_state['image_urls']:
+        st.subheader("Images Found on Website")
+        for img_url in st.session_state['image_urls']:
+            st.image(img_url)
+
+if __name__ == "__main__":
+    main()
